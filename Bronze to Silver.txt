@@ -1,0 +1,1670 @@
+Bronze to Silver:
+# ============================================================
+# VALIDAÇÃO DA CAMADA BRONZE
+# ============================================================
+
+storage_account_name = "adlsolistanalytics"
+container_name = "datalake"
+
+bronze_path = (
+    f"abfss://{container_name}@"
+    f"{storage_account_name}.dfs.core.windows.net/bronze/olist"
+)
+
+print(f"Bronze Path: {bronze_path}\n")
+
+
+# ============================================================
+# FUNÇÃO DE LEITURA
+# ============================================================
+
+def read_csv(path):
+    return (
+        spark.read
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "PERMISSIVE")
+        .csv(path)
+    )
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
+datasets_bronze = [
+    "olist_customers_dataset",
+    "olist_geolocation_dataset",
+    "olist_order_items_dataset",
+    "olist_order_payments_dataset",
+    "olist_order_reviews_dataset",
+    "olist_orders_dataset",
+    "olist_products_dataset",
+    "olist_sellers_dataset",
+    "product_category_name_translation"
+]
+
+
+# ============================================================
+# VALIDAÇÃO
+# ============================================================
+
+for dataset in datasets_bronze:
+    path = f"{bronze_path}/{dataset}"
+
+    try:
+        df = read_csv(path)
+
+        print(
+            f"{dataset:<42} "
+            f"Linhas: {df.count():>10} | "
+            f"Colunas: {len(df.columns):>2}"
+        )
+
+    except Exception as e:
+        print(f"❌ ERRO -> {dataset}")
+        print(str(e))
+
+reviews_path = f"{bronze_path}/olist_order_reviews_dataset"
+
+df_reviews_teste = (
+    spark.read
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .option("mode", "PERMISSIVE")
+    .option("multiLine", "true")
+    .option("quote", '"')
+    .option("escape", '"')
+    .csv(reviews_path)
+)
+
+print("Linhas:", df_reviews_teste.count())
+print("Colunas:", len(df_reviews_teste.columns))
+
+display(df_reviews_teste.limit(10))
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+storage_account_name = "adlsolistanalytics"
+container_name = "datalake"
+
+bronze_path = (
+    f"abfss://{container_name}@"
+    f"{storage_account_name}.dfs.core.windows.net/bronze/olist"
+)
+
+silver_path = (
+    f"abfss://{container_name}@"
+    f"{storage_account_name}.dfs.core.windows.net/silver/olist"
+)
+
+print("Bronze:", bronze_path)
+print("Silver:", silver_path)
+
+# Teste de conectividade
+display(dbutils.fs.ls(bronze_path))
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def read_csv(path):
+    return (
+        spark.read
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "PERMISSIVE")
+        .csv(path)
+    )
+
+
+def write_delta(df, path):
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(path)
+    )
+
+
+def clean_string(column_name):
+    return F.trim(F.col(column_name))
+
+
+def clean_upper(column_name):
+    return F.upper(F.trim(F.col(column_name)))
+
+
+def clean_lower(column_name):
+    return F.lower(F.trim(F.col(column_name)))
+
+# ============================================================
+# ORDERS
+# ============================================================
+
+df_orders_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_orders_dataset")
+)
+
+df_orders = (
+    df_orders_raw
+    .select(
+        F.trim(F.col("order_id")).alias("order_id"),
+        F.trim(F.col("customer_id")).alias("customer_id"),
+
+        F.lower(
+            F.trim(F.col("order_status"))
+        ).alias("order_status"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(order_purchase_timestamp),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("order_purchase_timestamp"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(order_approved_at),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("order_approved_at"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(order_delivered_carrier_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("order_delivered_carrier_date"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(order_delivered_customer_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("order_delivered_customer_date"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(order_estimated_delivery_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("order_estimated_delivery_date")
+    )
+    .filter(
+        F.col("order_id").isNotNull() &
+        F.col("customer_id").isNotNull()
+    )
+    .dropDuplicates(["order_id"])
+)
+
+write_delta(
+    df_orders,
+    f"{silver_path}/orders"
+)
+
+print(f"✅ orders: {df_orders.count():,} registros")
+
+# ============================================================
+# VALIDAÇÃO - ORDERS
+# ============================================================
+
+print("Quantidade de pedidos:", df_orders.count())
+
+print(
+    "Pedidos duplicados:",
+    df_orders
+        .groupBy("order_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "Sem order_id:",
+    df_orders
+        .filter(F.col("order_id").isNull())
+        .count()
+)
+
+print(
+    "Sem customer_id:",
+    df_orders
+        .filter(F.col("customer_id").isNull())
+        .count()
+)
+
+print(
+    "Sem data de compra:",
+    df_orders
+        .filter(F.col("order_purchase_timestamp").isNull())
+        .count()
+)
+
+display(
+    df_orders
+    .select(
+        "order_id",
+        "customer_id",
+        "order_status",
+        "order_purchase_timestamp",
+        "order_approved_at",
+        "order_delivered_carrier_date",
+        "order_delivered_customer_date",
+        "order_estimated_delivery_date"
+    )
+    .limit(10)
+)
+
+# ============================================================
+# ORDER ITEMS
+# GRÃO: 1 LINHA = 1 ITEM DE PEDIDO
+# ============================================================
+
+df_items_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_order_items_dataset")
+)
+
+df_items = (
+    df_items_raw
+    .select(
+        F.trim(F.col("order_id")).alias("order_id"),
+
+        F.expr(
+            "try_cast(trim(order_item_id) as int)"
+        ).alias("order_item_id"),
+
+        F.trim(F.col("product_id")).alias("product_id"),
+        F.trim(F.col("seller_id")).alias("seller_id"),
+
+        F.expr("""
+            try_to_timestamp(
+                trim(shipping_limit_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+        """).alias("shipping_limit_date"),
+
+        F.expr(
+            "try_cast(trim(price) as double)"
+        ).alias("price"),
+
+        F.expr(
+            "try_cast(trim(freight_value) as double)"
+        ).alias("freight_value")
+    )
+    .filter(
+        F.col("order_id").isNotNull() &
+        F.col("order_item_id").isNotNull() &
+        F.col("product_id").isNotNull() &
+        F.col("seller_id").isNotNull()
+    )
+    .dropDuplicates([
+        "order_id",
+        "order_item_id"
+    ])
+)
+
+write_delta(
+    df_items,
+    f"{silver_path}/order_items"
+)
+
+print(f"✅ order_items: {df_items.count():,} registros")
+
+# ============================================================
+# VALIDAÇÃO - ORDER ITEMS
+# ============================================================
+
+print("Quantidade de itens:", df_items.count())
+
+print(
+    "Chaves pedido/item duplicadas:",
+    df_items
+        .groupBy("order_id", "order_item_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "Sem order_id:",
+    df_items
+        .filter(F.col("order_id").isNull())
+        .count()
+)
+
+print(
+    "Sem product_id:",
+    df_items
+        .filter(F.col("product_id").isNull())
+        .count()
+)
+
+print(
+    "Sem seller_id:",
+    df_items
+        .filter(F.col("seller_id").isNull())
+        .count()
+)
+
+print(
+    "Preço nulo:",
+    df_items
+        .filter(F.col("price").isNull())
+        .count()
+)
+
+print(
+    "Frete nulo:",
+    df_items
+        .filter(F.col("freight_value").isNull())
+        .count()
+)
+
+print(
+    "Preço negativo:",
+    df_items
+        .filter(F.col("price") < 0)
+        .count()
+)
+
+print(
+    "Frete negativo:",
+    df_items
+        .filter(F.col("freight_value") < 0)
+        .count()
+)
+
+display(
+    df_items.limit(10)
+)
+
+# ============================================================
+# PAYMENTS
+# GRÃO: 1 LINHA = 1 REGISTRO DE PAGAMENTO DO PEDIDO
+# ============================================================
+
+df_payments_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_order_payments_dataset")
+)
+
+df_payments = (
+    df_payments_raw
+    .select(
+        F.trim(F.col("order_id")).alias("order_id"),
+
+        F.expr(
+            "try_cast(trim(payment_sequential) as int)"
+        ).alias("payment_sequential"),
+
+        F.lower(
+            F.trim(F.col("payment_type"))
+        ).alias("payment_type"),
+
+        F.expr(
+            "try_cast(trim(payment_installments) as int)"
+        ).alias("payment_installments"),
+
+        F.expr(
+            "try_cast(trim(payment_value) as double)"
+        ).alias("payment_value")
+    )
+
+    # Chaves mínimas obrigatórias
+    .filter(
+        F.col("order_id").isNotNull() &
+        F.col("payment_sequential").isNotNull()
+    )
+
+    # Uma linha por pagamento/sequência
+    .dropDuplicates([
+        "order_id",
+        "payment_sequential"
+    ])
+
+    # Indicador de qualidade
+    .withColumn(
+        "payment_installments_valido",
+        F.when(
+            F.col("payment_installments").isNull(),
+            F.lit(False)
+        )
+        .when(
+            F.col("payment_installments") >= 1,
+            F.lit(True)
+        )
+        .otherwise(
+            F.lit(False)
+        )
+    )
+)
+
+write_delta(
+    df_payments,
+    f"{silver_path}/payments"
+)
+
+print(f"✅ payments: {df_payments.count():,} registros")
+
+# ============================================================
+# VALIDAÇÃO FINAL - PAYMENTS
+# ============================================================
+
+print("Quantidade de pagamentos:", df_payments.count())
+
+print(
+    "Chaves order/sequencial duplicadas:",
+    df_payments
+        .groupBy("order_id", "payment_sequential")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "Sem order_id:",
+    df_payments
+        .filter(F.col("order_id").isNull())
+        .count()
+)
+
+print(
+    "Sem payment_sequential:",
+    df_payments
+        .filter(F.col("payment_sequential").isNull())
+        .count()
+)
+
+print(
+    "Sem payment_type:",
+    df_payments
+        .filter(F.col("payment_type").isNull())
+        .count()
+)
+
+print(
+    "Valor nulo:",
+    df_payments
+        .filter(F.col("payment_value").isNull())
+        .count()
+)
+
+print(
+    "Valor negativo:",
+    df_payments
+        .filter(F.col("payment_value") < 0)
+        .count()
+)
+
+print(
+    "Parcelas inválidas:",
+    df_payments
+        .filter(~F.col("payment_installments_valido"))
+        .count()
+)
+
+# ============================================================
+# INVESTIGAÇÃO - PAYMENTS COM PARCELAS < 1
+# ============================================================
+
+display(
+    df_payments
+    .filter(F.col("payment_installments") < 1)
+    .orderBy("order_id")
+)
+
+print(
+    "Pagamentos com parcelas nulas:",
+    df_payments
+        .filter(F.col("payment_installments").isNull())
+        .count()
+)
+
+# ============================================================
+# CUSTOMERS
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 customer_id
+#
+# OBSERVAÇÃO:
+# customer_id       -> identifica o registro associado ao pedido
+# customer_unique_id -> identifica o cliente real
+# ============================================================
+
+df_customers_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_customers_dataset")
+)
+
+df_customers = (
+    df_customers_raw
+    .select(
+        F.trim(
+            F.col("customer_id")
+        ).alias("customer_id"),
+
+        F.trim(
+            F.col("customer_unique_id")
+        ).alias("customer_unique_id"),
+
+        # Mantemos o CEP com 5 dígitos
+        F.lpad(
+            F.regexp_replace(
+                F.trim(
+                    F.col("customer_zip_code_prefix")
+                ),
+                "[^0-9]",
+                ""
+            ),
+            5,
+            "0"
+        ).alias("customer_zip_code_prefix"),
+
+        # Padronização textual
+        F.upper(
+            F.trim(
+                F.col("customer_city")
+            )
+        ).alias("customer_city"),
+
+        F.upper(
+            F.trim(
+                F.col("customer_state")
+            )
+        ).alias("customer_state")
+    )
+
+    # Chaves obrigatórias
+    .filter(
+        F.col("customer_id").isNotNull() &
+        F.col("customer_unique_id").isNotNull()
+    )
+
+    # 1 registro por customer_id
+    .dropDuplicates(["customer_id"])
+)
+
+write_delta(
+    df_customers,
+    f"{silver_path}/customers"
+)
+
+print(
+    f"✅ customers: {df_customers.count():,} registros"
+)
+
+# ============================================================
+# VALIDAÇÃO - CUSTOMERS
+# ============================================================
+
+print(
+    "Quantidade de customer_id:",
+    df_customers.count()
+)
+
+print(
+    "customer_id duplicados:",
+    df_customers
+        .groupBy("customer_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "customer_unique_id nulos:",
+    df_customers
+        .filter(
+            F.col("customer_unique_id").isNull()
+        )
+        .count()
+)
+
+print(
+    "CEP nulo:",
+    df_customers
+        .filter(
+            F.col("customer_zip_code_prefix").isNull()
+        )
+        .count()
+)
+
+print(
+    "Cidade nula:",
+    df_customers
+        .filter(
+            F.col("customer_city").isNull()
+        )
+        .count()
+)
+
+print(
+    "UF nula:",
+    df_customers
+        .filter(
+            F.col("customer_state").isNull()
+        )
+        .count()
+)
+
+print(
+    "Clientes únicos:",
+    df_customers
+        .select("customer_unique_id")
+        .distinct()
+        .count()
+)
+
+display(
+    df_customers.limit(10)
+)
+
+# ============================================================
+# PRODUCTS
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 produto
+# ============================================================
+
+df_products_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_products_dataset")
+)
+
+df_products = (
+    df_products_raw
+    .select(
+        # Chave
+        F.trim(
+            F.col("product_id")
+        ).alias("product_id"),
+
+        # Categoria original
+        F.lower(
+            F.trim(
+                F.col("product_category_name")
+            )
+        ).alias("product_category_name"),
+
+        # Características textuais
+        F.expr(
+            "try_cast(trim(product_name_lenght) as int)"
+        ).alias("product_name_length"),
+
+        F.expr(
+            "try_cast(trim(product_description_lenght) as int)"
+        ).alias("product_description_length"),
+
+        # Quantidade de fotos
+        F.expr(
+            "try_cast(trim(product_photos_qty) as int)"
+        ).alias("product_photos_qty"),
+
+        # Dimensões físicas
+        F.expr(
+            "try_cast(trim(product_weight_g) as double)"
+        ).alias("product_weight_g"),
+
+        F.expr(
+            "try_cast(trim(product_length_cm) as double)"
+        ).alias("product_length_cm"),
+
+        F.expr(
+            "try_cast(trim(product_height_cm) as double)"
+        ).alias("product_height_cm"),
+
+        F.expr(
+            "try_cast(trim(product_width_cm) as double)"
+        ).alias("product_width_cm")
+    )
+
+    # Produto precisa ter chave
+    .filter(
+        F.col("product_id").isNotNull()
+    )
+
+    # Uma linha por produto
+    .dropDuplicates(["product_id"])
+)
+
+write_delta(
+    df_products,
+    f"{silver_path}/products"
+)
+
+print(
+    f"✅ products: {df_products.count():,} registros"
+)
+
+# ============================================================
+# VALIDAÇÃO - PRODUCTS
+# ============================================================
+
+print(
+    "Quantidade de produtos:",
+    df_products.count()
+)
+
+print(
+    "Product_id duplicados:",
+    df_products
+        .groupBy("product_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "Categoria nula:",
+    df_products
+        .filter(
+            F.col("product_category_name").isNull()
+        )
+        .count()
+)
+
+print(
+    "Peso nulo:",
+    df_products
+        .filter(
+            F.col("product_weight_g").isNull()
+        )
+        .count()
+)
+
+print(
+    "Comprimento nulo:",
+    df_products
+        .filter(
+            F.col("product_length_cm").isNull()
+        )
+        .count()
+)
+
+print(
+    "Altura nula:",
+    df_products
+        .filter(
+            F.col("product_height_cm").isNull()
+        )
+        .count()
+)
+
+print(
+    "Largura nula:",
+    df_products
+        .filter(
+            F.col("product_width_cm").isNull()
+        )
+        .count()
+)
+
+print(
+    "Peso negativo:",
+    df_products
+        .filter(
+            F.col("product_weight_g") < 0
+        )
+        .count()
+)
+
+print(
+    "Dimensões negativas:",
+    df_products
+        .filter(
+            (F.col("product_length_cm") < 0) |
+            (F.col("product_height_cm") < 0) |
+            (F.col("product_width_cm") < 0)
+        )
+        .count()
+)
+
+display(
+    df_products.limit(10)
+)
+
+# ============================================================
+# SELLERS
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 vendedor
+# ============================================================
+
+df_sellers_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_sellers_dataset")
+)
+
+df_sellers = (
+    df_sellers_raw
+    .select(
+        F.trim(
+            F.col("seller_id")
+        ).alias("seller_id"),
+
+        F.lpad(
+            F.regexp_replace(
+                F.trim(
+                    F.col("seller_zip_code_prefix")
+                ),
+                "[^0-9]",
+                ""
+            ),
+            5,
+            "0"
+        ).alias("seller_zip_code_prefix"),
+
+        F.upper(
+            F.trim(
+                F.col("seller_city")
+            )
+        ).alias("seller_city"),
+
+        F.upper(
+            F.trim(
+                F.col("seller_state")
+            )
+        ).alias("seller_state")
+    )
+
+    .filter(
+        F.col("seller_id").isNotNull()
+    )
+
+    .dropDuplicates(["seller_id"])
+)
+
+write_delta(
+    df_sellers,
+    f"{silver_path}/sellers"
+)
+
+print(
+    f"✅ sellers: {df_sellers.count():,} registros"
+)
+
+# ============================================================
+# VALIDAÇÃO - SELLERS
+# ============================================================
+
+print(
+    "Quantidade de vendedores:",
+    df_sellers.count()
+)
+
+print(
+    "seller_id duplicados:",
+    df_sellers
+        .groupBy("seller_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "CEP nulo:",
+    df_sellers
+        .filter(
+            F.col("seller_zip_code_prefix").isNull()
+        )
+        .count()
+)
+
+print(
+    "Cidade nula:",
+    df_sellers
+        .filter(
+            F.col("seller_city").isNull()
+        )
+        .count()
+)
+
+print(
+    "UF nula:",
+    df_sellers
+        .filter(
+            F.col("seller_state").isNull()
+        )
+        .count()
+)
+
+display(
+    df_sellers.limit(10)
+)
+
+# ============================================================
+# GEOLOCATION
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 registro geográfico da origem
+#
+# IMPORTANTE:
+# O mesmo CEP pode aparecer várias vezes.
+# Não vamos deduplicar por CEP na Silver.
+# A consolidação será feita posteriormente na Gold.
+# ============================================================
+
+df_geo_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_geolocation_dataset")
+)
+
+df_geo = (
+    df_geo_raw
+    .select(
+        F.lpad(
+            F.regexp_replace(
+                F.trim(
+                    F.col("geolocation_zip_code_prefix")
+                ),
+                "[^0-9]",
+                ""
+            ),
+            5,
+            "0"
+        ).alias("geolocation_zip_code_prefix"),
+
+        F.expr(
+            "try_cast(trim(geolocation_lat) as double)"
+        ).alias("latitude"),
+
+        F.expr(
+            "try_cast(trim(geolocation_lng) as double)"
+        ).alias("longitude"),
+
+        F.upper(
+            F.trim(
+                F.col("geolocation_city")
+            )
+        ).alias("geolocation_city"),
+
+        F.upper(
+            F.trim(
+                F.col("geolocation_state")
+            )
+        ).alias("geolocation_state")
+    )
+
+    .filter(
+        F.col("geolocation_zip_code_prefix").isNotNull()
+    )
+
+    .dropDuplicates()
+)
+
+write_delta(
+    df_geo,
+    f"{silver_path}/geolocation"
+)
+
+print(
+    f"✅ geolocation: {df_geo.count():,} registros"
+)
+
+# ============================================================
+# VALIDAÇÃO - GEOLOCATION
+# ============================================================
+
+print(
+    "Quantidade de registros:",
+    df_geo.count()
+)
+
+print(
+    "CEP nulo:",
+    df_geo
+        .filter(
+            F.col("geolocation_zip_code_prefix").isNull()
+        )
+        .count()
+)
+
+print(
+    "Latitude nula:",
+    df_geo
+        .filter(
+            F.col("latitude").isNull()
+        )
+        .count()
+)
+
+print(
+    "Longitude nula:",
+    df_geo
+        .filter(
+            F.col("longitude").isNull()
+        )
+        .count()
+)
+
+print(
+    "Latitude fora do intervalo:",
+    df_geo
+        .filter(
+            ~F.col("latitude").between(-90, 90)
+        )
+        .count()
+)
+
+print(
+    "Longitude fora do intervalo:",
+    df_geo
+        .filter(
+            ~F.col("longitude").between(-180, 180)
+        )
+        .count()
+)
+
+print(
+    "CEPs distintos:",
+    df_geo
+        .select("geolocation_zip_code_prefix")
+        .distinct()
+        .count()
+)
+
+display(
+    df_geo.limit(10)
+)
+
+display(
+    df_geo
+    .groupBy("geolocation_zip_code_prefix")
+    .count()
+    .orderBy(F.desc("count"))
+    .limit(20)
+)
+
+# ============================================================
+# CATEGORY TRANSLATION
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 categoria original
+# ============================================================
+
+df_categories_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/product_category_name_translation")
+)
+
+df_categories = (
+    df_categories_raw
+    .select(
+        F.lower(
+            F.trim(
+                F.col("product_category_name")
+            )
+        ).alias("product_category_name"),
+
+        F.lower(
+            F.trim(
+                F.col("product_category_name_english")
+            )
+        ).alias("product_category_name_english")
+    )
+
+    .filter(
+        F.col("product_category_name").isNotNull()
+    )
+
+    .dropDuplicates([
+        "product_category_name"
+    ])
+)
+
+write_delta(
+    df_categories,
+    f"{silver_path}/categories"
+)
+
+print(
+    f"✅ categories: {df_categories.count():,} registros"
+)
+
+# ============================================================
+# CATEGORY TRANSLATION
+# ============================================================
+# GRANULARIDADE:
+# 1 linha = 1 categoria original
+# ============================================================
+
+df_categories_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/product_category_name_translation")
+)
+
+df_categories = (
+    df_categories_raw
+    .select(
+        F.lower(
+            F.trim(
+                F.col("product_category_name")
+            )
+        ).alias("product_category_name"),
+
+        F.lower(
+            F.trim(
+                F.col("product_category_name_english")
+            )
+        ).alias("product_category_name_english")
+    )
+
+    .filter(
+        F.col("product_category_name").isNotNull()
+    )
+
+    .dropDuplicates([
+        "product_category_name"
+    ])
+)
+
+write_delta(
+    df_categories,
+    f"{silver_path}/categories"
+)
+
+print(
+    f"✅ categories: {df_categories.count():,} registros"
+)
+
+# ============================================================
+# VALIDAÇÃO - CATEGORIES
+# ============================================================
+
+print(
+    "Quantidade de categorias:",
+    df_categories.count()
+)
+
+print(
+    "Categorias duplicadas:",
+    df_categories
+        .groupBy("product_category_name")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "Categoria original nula:",
+    df_categories
+        .filter(
+            F.col("product_category_name").isNull()
+        )
+        .count()
+)
+
+print(
+    "Categoria inglesa nula:",
+    df_categories
+        .filter(
+            F.col("product_category_name_english").isNull()
+        )
+        .count()
+)
+
+display(
+    df_categories.limit(20)
+)
+
+# ============================================================
+# REVIEWS
+# ============================================================
+
+df_reviews_raw = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .option("mode", "PERMISSIVE")
+    .option("quote", '"')
+    .option("escape", '"')
+    .option("multiLine", "true")
+    .option("ignoreLeadingWhiteSpace", "true")
+    .option("ignoreTrailingWhiteSpace", "true")
+    .csv(f"{bronze_path}/olist_order_reviews_dataset")
+)
+
+print("Schema bruto:")
+df_reviews_raw.printSchema()
+
+display(df_reviews_raw.limit(10))
+
+# ============================================================
+# TRATAMENTO SILVER - REVIEWS
+# ============================================================
+
+df_reviews = (
+    df_reviews_raw
+    .select(
+        # Chaves
+        F.trim(F.col("review_id")).alias("review_id"),
+
+        F.trim(F.col("order_id")).alias("order_id"),
+
+        # Nota da avaliação
+        F.expr(
+            "try_cast(trim(review_score) as int)"
+        ).alias("review_score"),
+
+        # Comentários
+        F.trim(
+            F.col("review_comment_title")
+        ).alias("review_comment_title"),
+
+        F.trim(
+            F.col("review_comment_message")
+        ).alias("review_comment_message"),
+
+        # Datas
+        F.expr(
+            """
+            try_to_timestamp(
+                trim(review_creation_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+            """
+        ).alias("review_creation_date"),
+
+        F.expr(
+            """
+            try_to_timestamp(
+                trim(review_answer_timestamp),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+            """
+        ).alias("review_answer_timestamp")
+    )
+
+    .filter(
+        F.col("review_id").isNotNull() &
+        F.col("order_id").isNotNull()
+    )
+
+    .dropDuplicates(["review_id", "order_id"])
+)
+
+write_delta(
+    df_reviews,
+    f"{silver_path}/reviews"
+)
+
+print(f"✅ reviews: {df_reviews.count():,} registros")
+
+# ============================================================
+# TRATAMENTO SILVER - REVIEWS
+# ============================================================
+
+df_reviews = (
+    df_reviews_raw
+    .select(
+        # Chaves
+        F.trim(F.col("review_id")).alias("review_id"),
+
+        F.trim(F.col("order_id")).alias("order_id"),
+
+        # Nota da avaliação
+        F.expr(
+            "try_cast(trim(review_score) as int)"
+        ).alias("review_score"),
+
+        # Comentários
+        F.trim(
+            F.col("review_comment_title")
+        ).alias("review_comment_title"),
+
+        F.trim(
+            F.col("review_comment_message")
+        ).alias("review_comment_message"),
+
+        # Datas
+        F.expr(
+            """
+            try_to_timestamp(
+                trim(review_creation_date),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+            """
+        ).alias("review_creation_date"),
+
+        F.expr(
+            """
+            try_to_timestamp(
+                trim(review_answer_timestamp),
+                'yyyy-MM-dd HH:mm:ss'
+            )
+            """
+        ).alias("review_answer_timestamp")
+    )
+
+    .filter(
+        F.col("review_id").isNotNull() &
+        F.col("order_id").isNotNull()
+    )
+
+    .dropDuplicates(["review_id", "order_id"])
+)
+
+write_delta(
+    df_reviews,
+    f"{silver_path}/reviews"
+)
+
+print(f"✅ reviews: {df_reviews.count():,} registros")
+
+# ============================================================
+# VALIDAÇÃO FINAL - REVIEWS
+# ============================================================
+
+print("Quantidade de registros:", df_reviews.count())
+
+print(
+    "Notas fora do intervalo 1-5:",
+    df_reviews
+        .filter(
+            F.col("review_score").isNotNull() &
+            ~F.col("review_score").between(1, 5)
+        )
+        .count()
+)
+
+print(
+    "Sem review_id:",
+    df_reviews.filter(F.col("review_id").isNull()).count()
+)
+
+print(
+    "Sem order_id:",
+    df_reviews.filter(F.col("order_id").isNull()).count()
+)
+
+print(
+    "Sem data de criação:",
+    df_reviews.filter(
+        F.col("review_creation_date").isNull()
+    ).count()
+)
+
+display(
+    df_reviews
+    .select(
+        "review_id",
+        "order_id",
+        "review_score",
+        "review_comment_title",
+        "review_comment_message",
+        "review_creation_date",
+        "review_answer_timestamp"
+    )
+    .limit(10)
+)
+
+# ============================================================
+# VALIDAÇÃO REFERENCIAL - SILVER
+# ============================================================
+
+print("===================================================")
+print("VALIDAÇÃO REFERENCIAL DA SILVER")
+print("===================================================")
+
+# ----------------------------------------------------
+# 1. ORDER_ITEMS -> ORDERS
+# ----------------------------------------------------
+
+items_sem_order = (
+    df_items.alias("i")
+    .join(
+        df_orders.select("order_id").alias("o"),
+        F.col("i.order_id") == F.col("o.order_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "order_items sem order correspondente:",
+    items_sem_order
+)
+
+
+# ----------------------------------------------------
+# 2. ORDER_ITEMS -> PRODUCTS
+# ----------------------------------------------------
+
+items_sem_product = (
+    df_items.alias("i")
+    .join(
+        df_products.select("product_id").alias("p"),
+        F.col("i.product_id") == F.col("p.product_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "order_items sem product correspondente:",
+    items_sem_product
+)
+
+
+# ----------------------------------------------------
+# 3. ORDER_ITEMS -> SELLERS
+# ----------------------------------------------------
+
+items_sem_seller = (
+    df_items.alias("i")
+    .join(
+        df_sellers.select("seller_id").alias("s"),
+        F.col("i.seller_id") == F.col("s.seller_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "order_items sem seller correspondente:",
+    items_sem_seller
+)
+
+
+# ----------------------------------------------------
+# 4. ORDERS -> CUSTOMERS
+# ----------------------------------------------------
+
+orders_sem_customer = (
+    df_orders.alias("o")
+    .join(
+        df_customers.select("customer_id").alias("c"),
+        F.col("o.customer_id") == F.col("c.customer_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "orders sem customer correspondente:",
+    orders_sem_customer
+)
+
+
+# ----------------------------------------------------
+# 5. PAYMENTS -> ORDERS
+# ----------------------------------------------------
+
+payments_sem_order = (
+    df_payments.alias("p")
+    .join(
+        df_orders.select("order_id").alias("o"),
+        F.col("p.order_id") == F.col("o.order_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "payments sem order correspondente:",
+    payments_sem_order
+)
+
+
+# ----------------------------------------------------
+# 6. REVIEWS -> ORDERS
+# ----------------------------------------------------
+
+reviews_sem_order = (
+    df_reviews.alias("r")
+    .join(
+        df_orders.select("order_id").alias("o"),
+        F.col("r.order_id") == F.col("o.order_id"),
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "reviews sem order correspondente:",
+    reviews_sem_order
+)
+
+
+# ----------------------------------------------------
+# 7. PRODUCTS -> CATEGORIES
+# ----------------------------------------------------
+
+products_sem_categoria = (
+    df_products
+    .filter(F.col("product_category_name").isNotNull())
+    .join(
+        df_categories.select("product_category_name"),
+        "product_category_name",
+        "left_anti"
+    )
+    .count()
+)
+
+print(
+    "products com categoria sem tradução:",
+    products_sem_categoria
+)
+
+
+print("===================================================")
+print("VALIDAÇÃO CONCLUÍDA")
+print("===================================================")
+
+# ============================================================
+# RELAÇÃO CUSTOMER_ID x CUSTOMER_UNIQUE_ID
+# ============================================================
+
+df_customer_recurrencia = (
+    df_customers
+    .groupBy("customer_unique_id")
+    .agg(
+        F.countDistinct("customer_id")
+            .alias("qtd_customer_id")
+    )
+)
+
+display(
+    df_customer_recurrencia
+    .groupBy("qtd_customer_id")
+    .count()
+    .orderBy("qtd_customer_id")
+)
+
+display(
+    dbutils.fs.ls(
+        "abfss://datalake@adlsolistanalytics.dfs.core.windows.net/silver/olist"
+    )
+)
+

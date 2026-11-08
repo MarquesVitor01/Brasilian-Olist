@@ -1,0 +1,1088 @@
+Silver to Gold:
+
+# ============================================================
+# 02 - TRANSFORMAÇÃO GOLD
+# ============================================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+storage_account_name = "adlsolistanalytics"
+container_name = "datalake"
+
+silver_path = (
+    f"abfss://{container_name}@"
+    f"{storage_account_name}.dfs.core.windows.net/silver/olist"
+)
+
+gold_path = (
+    f"abfss://{container_name}@"
+    f"{storage_account_name}.dfs.core.windows.net/gold/olist"
+)
+
+print("Silver:", silver_path)
+print("Gold:", gold_path)
+
+display(dbutils.fs.ls(silver_path))
+
+# ============================================================
+# LEITURA DA SILVER
+# ============================================================
+
+df_orders = spark.read.format("delta").load(
+    f"{silver_path}/orders"
+)
+
+df_items = spark.read.format("delta").load(
+    f"{silver_path}/order_items"
+)
+
+df_payments = spark.read.format("delta").load(
+    f"{silver_path}/payments"
+)
+
+df_reviews = spark.read.format("delta").load(
+    f"{silver_path}/reviews"
+)
+
+df_customers = spark.read.format("delta").load(
+    f"{silver_path}/customers"
+)
+
+df_products = spark.read.format("delta").load(
+    f"{silver_path}/products"
+)
+
+df_sellers = spark.read.format("delta").load(
+    f"{silver_path}/sellers"
+)
+
+df_geo = spark.read.format("delta").load(
+    f"{silver_path}/geolocation"
+)
+
+df_categories = spark.read.format("delta").load(
+    f"{silver_path}/categories"
+)
+
+print("✅ Silver carregada.")
+
+# ============================================================
+# dCLIENTE
+# GRÃO: 1 LINHA = 1 CLIENTE REAL
+# CHAVE: customer_unique_id
+# ============================================================
+
+window_cliente = (
+    Window
+    .partitionBy("customer_unique_id")
+    .orderBy(F.col("customer_id").asc())
+)
+
+df_dCliente = (
+    df_customers
+    .withColumn(
+        "rn",
+        F.row_number().over(window_cliente)
+    )
+    .withColumn(
+        "qtd_customer_ids",
+        F.count("customer_id").over(
+            Window.partitionBy("customer_unique_id")
+        )
+    )
+    .filter(F.col("rn") == 1)
+    .select(
+        F.col("customer_unique_id").alias("sk_cliente"),
+
+        F.col("customer_zip_code_prefix")
+            .alias("sk_cep_cliente"),
+
+        F.col("customer_city")
+            .alias("cidade_cliente"),
+
+        F.col("customer_state")
+            .alias("uf_cliente"),
+
+        F.col("qtd_customer_ids")
+    )
+)
+
+(
+    df_dCliente.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/dCliente")
+)
+
+print(f"✅ dCliente: {df_dCliente.count():,}")
+
+# ============================================================
+# dPRODUTO
+# GRÃO: 1 LINHA = 1 PRODUTO
+# ============================================================
+
+df_dProduto = (
+    df_products.alias("p")
+
+    .join(
+        df_categories.alias("c"),
+        F.col("p.product_category_name") ==
+        F.col("c.product_category_name"),
+        "left"
+    )
+
+    .select(
+        F.col("p.product_id")
+            .alias("sk_produto"),
+
+        # Categoria para análise
+        F.coalesce(
+            F.col("c.product_category_name_english"),
+            F.col("p.product_category_name"),
+            F.lit("sem_categoria")
+        ).alias("categoria_produto"),
+
+        # Categoria original
+        F.col("p.product_category_name")
+            .alias("categoria_produto_original"),
+
+        F.when(
+            F.col("c.product_category_name_english").isNotNull(),
+            F.lit("Traduzida")
+        )
+        .when(
+            F.col("p.product_category_name").isNotNull(),
+            F.lit("Sem tradução")
+        )
+        .otherwise(
+            F.lit("Sem categoria")
+        )
+        .alias("status_categoria"),
+
+        # Características
+        F.col("p.product_name_length"),
+        F.col("p.product_description_length"),
+        F.col("p.product_photos_qty"),
+
+        # Peso
+        F.col("p.product_weight_g"),
+
+        (
+            F.col("p.product_weight_g") / 1000
+        ).alias("product_weight_kg"),
+
+        # Dimensões
+        F.col("p.product_length_cm"),
+        F.col("p.product_height_cm"),
+        F.col("p.product_width_cm"),
+
+        # Volume
+        (
+            F.col("p.product_length_cm") *
+            F.col("p.product_height_cm") *
+            F.col("p.product_width_cm")
+        ).alias("volume_cm3")
+    )
+
+    .dropDuplicates(["sk_produto"])
+)
+
+(
+    df_dProduto.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/dProduto")
+)
+
+print(f"✅ dProduto: {df_dProduto.count():,}")
+
+# ============================================================
+# dVENDEDOR
+# GRÃO: 1 LINHA = 1 VENDEDOR
+# ============================================================
+
+df_dVendedor = (
+    df_sellers
+    .select(
+        F.col("seller_id")
+            .alias("sk_vendedor"),
+
+        F.col("seller_zip_code_prefix")
+            .alias("sk_cep_vendedor"),
+
+        F.col("seller_city")
+            .alias("cidade_vendedor"),
+
+        F.col("seller_state")
+            .alias("uf_vendedor")
+    )
+    .dropDuplicates(["sk_vendedor"])
+)
+
+(
+    df_dVendedor.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/dVendedor")
+)
+
+print(f"✅ dVendedor: {df_dVendedor.count():,}")
+
+# ============================================================
+# dLOCALIDADE
+# GRÃO: 1 LINHA = 1 PREFIXO DE CEP
+# ============================================================
+
+df_dLocalidade = (
+    df_geo
+    .groupBy("geolocation_zip_code_prefix")
+    .agg(
+        F.avg("latitude")
+            .alias("latitude"),
+
+        F.avg("longitude")
+            .alias("longitude"),
+
+        F.first(
+            "geolocation_city",
+            ignorenulls=True
+        ).alias("cidade"),
+
+        F.first(
+            "geolocation_state",
+            ignorenulls=True
+        ).alias("uf"),
+
+        F.count("*")
+            .alias("qtd_registros_geo")
+    )
+
+    .select(
+        F.col("geolocation_zip_code_prefix")
+            .alias("sk_cep"),
+
+        "latitude",
+        "longitude",
+        "cidade",
+        "uf",
+        "qtd_registros_geo"
+    )
+)
+
+(
+    df_dLocalidade.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/dLocalidade")
+)
+
+print(f"✅ dLocalidade: {df_dLocalidade.count():,}")
+
+# ============================================================
+# dCALENDARIO
+# ============================================================
+
+df_datas = (
+    df_orders
+    .select(
+        F.to_date(
+            "order_purchase_timestamp"
+        ).alias("data")
+    )
+
+    .union(
+        df_orders.select(
+            F.to_date(
+                "order_approved_at"
+            ).alias("data")
+        )
+    )
+
+    .union(
+        df_orders.select(
+            F.to_date(
+                "order_delivered_carrier_date"
+            ).alias("data")
+        )
+    )
+
+    .union(
+        df_orders.select(
+            F.to_date(
+                "order_delivered_customer_date"
+            ).alias("data")
+        )
+    )
+
+    .union(
+        df_orders.select(
+            F.to_date(
+                "order_estimated_delivery_date"
+            ).alias("data")
+        )
+    )
+
+    .filter(F.col("data").isNotNull())
+)
+
+
+# ============================================================
+# DATA MÍNIMA E MÁXIMA
+# ============================================================
+
+data_min = df_datas.agg(
+    F.min("data")
+).first()[0]
+
+data_max = df_datas.agg(
+    F.max("data")
+).first()[0]
+
+
+# ============================================================
+# CRIAÇÃO DO CALENDÁRIO
+# ============================================================
+
+df_dCalendario = (
+    spark.sql(
+        f"""
+        SELECT explode(
+            sequence(
+                to_date('{data_min}'),
+                to_date('{data_max}'),
+                interval 1 day
+            )
+        ) AS data
+        """
+    )
+
+    .select(
+        "data",
+
+        # Chave da dimensão
+        F.date_format(
+            "data",
+            "yyyyMMdd"
+        ).cast("int").alias("sk_data"),
+
+        # Ano
+        F.year("data").alias("ano"),
+
+        # Número do mês
+        F.month("data").alias("mes"),
+
+        # Nome do mês em português
+        F.when(F.month("data") == 1, "Janeiro")
+         .when(F.month("data") == 2, "Fevereiro")
+         .when(F.month("data") == 3, "Março")
+         .when(F.month("data") == 4, "Abril")
+         .when(F.month("data") == 5, "Maio")
+         .when(F.month("data") == 6, "Junho")
+         .when(F.month("data") == 7, "Julho")
+         .when(F.month("data") == 8, "Agosto")
+         .when(F.month("data") == 9, "Setembro")
+         .when(F.month("data") == 10, "Outubro")
+         .when(F.month("data") == 11, "Novembro")
+         .when(F.month("data") == 12, "Dezembro")
+         .alias("nome_mes"),
+
+        # Dia do mês
+        F.dayofmonth("data").alias("dia"),
+
+        # 1 = Segunda-feira ... 7 = Domingo
+        F.weekday("data").alias("_dia_semana_zero"),
+
+        # Semana do ano
+        F.weekofyear("data").alias("semana_ano"),
+
+        # Trimestre
+        F.quarter("data").alias("trimestre"),
+
+        # Ano-mês
+        F.date_format(
+            "data",
+            "yyyy-MM"
+        ).alias("ano_mes")
+    )
+
+    # ========================================================
+    # DIA DA SEMANA
+    # ========================================================
+
+    .withColumn(
+        "dia_semana",
+        F.col("_dia_semana_zero") + 1
+    )
+
+    .withColumn(
+        "nome_dia_semana",
+        F.when(F.col("dia_semana") == 1, "Segunda-feira")
+         .when(F.col("dia_semana") == 2, "Terça-feira")
+         .when(F.col("dia_semana") == 3, "Quarta-feira")
+         .when(F.col("dia_semana") == 4, "Quinta-feira")
+         .when(F.col("dia_semana") == 5, "Sexta-feira")
+         .when(F.col("dia_semana") == 6, "Sábado")
+         .when(F.col("dia_semana") == 7, "Domingo")
+    )
+
+    # ========================================================
+    # FIM DE SEMANA
+    # ========================================================
+
+    .withColumn(
+        "fim_de_semana",
+        F.col("dia_semana").isin(6, 7)
+    )
+
+    # Coluna auxiliar não precisa ir para Gold
+    .drop("_dia_semana_zero")
+)
+
+
+# ============================================================
+# GRAVAÇÃO GOLD
+# ============================================================
+
+(
+    df_dCalendario.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/dCalendario")
+)
+
+print(f"✅ dCalendario: {df_dCalendario.count():,}")
+
+# ============================================================
+# AGREGAÇÃO DOS ITENS POR PEDIDO
+# ============================================================
+
+df_items_pedido = (
+    df_items
+    .groupBy("order_id")
+    .agg(
+        F.count("*")
+            .alias("qtd_itens"),
+
+        F.sum("price")
+            .alias("valor_produtos"),
+
+        F.sum("freight_value")
+            .alias("valor_frete")
+    )
+)
+
+# ============================================================
+# AGREGAÇÃO DOS PAGAMENTOS POR PEDIDO
+# ============================================================
+
+df_payments_pedido = (
+    df_payments
+    .groupBy("order_id")
+    .agg(
+        F.sum("payment_value")
+            .alias("valor_pago"),
+
+        F.count("*")
+            .alias("qtd_pagamentos"),
+
+        F.max("payment_installments")
+            .alias("maior_numero_parcelas"),
+
+        F.sum(
+            F.when(
+                F.col("payment_installments_valido"),
+                1
+            ).otherwise(0)
+        ).alias("qtd_pagamentos_parcelamento_valido")
+    )
+)
+
+# ============================================================
+# fPEDIDOS
+# GRÃO: 1 LINHA = 1 PEDIDO
+# ============================================================
+
+df_fPedidos = (
+    df_orders.alias("o")
+
+    .join(
+        df_customers.alias("c"),
+        F.col("o.customer_id") ==
+        F.col("c.customer_id"),
+        "left"
+    )
+
+    .join(
+        df_items_pedido.alias("i"),
+        F.col("o.order_id") ==
+        F.col("i.order_id"),
+        "left"
+    )
+
+    .join(
+        df_payments_pedido.alias("p"),
+        F.col("o.order_id") ==
+        F.col("p.order_id"),
+        "left"
+    )
+
+    .select(
+        F.col("o.order_id")
+            .alias("id_pedido"),
+
+        F.col("c.customer_unique_id")
+            .alias("sk_cliente"),
+
+        F.col("c.customer_zip_code_prefix")
+            .alias("sk_cep_cliente"),
+
+        F.col("o.order_status")
+            .alias("status_pedido"),
+
+        F.to_date(
+            "o.order_purchase_timestamp"
+        ).alias("data_compra"),
+
+        F.to_date(
+            "o.order_approved_at"
+        ).alias("data_aprovacao"),
+
+        F.to_date(
+            "o.order_delivered_carrier_date"
+        ).alias("data_envio"),
+
+        F.to_date(
+            "o.order_delivered_customer_date"
+        ).alias("data_entrega"),
+
+        F.to_date(
+            "o.order_estimated_delivery_date"
+        ).alias("data_entrega_estimada"),
+
+        F.coalesce(
+            F.col("i.qtd_itens"),
+            F.lit(0)
+        ).alias("qtd_itens"),
+
+        F.coalesce(
+            F.col("i.valor_produtos"),
+            F.lit(0.0)
+        ).alias("valor_produtos"),
+
+        F.coalesce(
+            F.col("i.valor_frete"),
+            F.lit(0.0)
+        ).alias("valor_frete"),
+
+        F.coalesce(
+            F.col("p.valor_pago"),
+            F.lit(0.0)
+        ).alias("valor_pago"),
+
+        F.coalesce(
+            F.col("p.qtd_pagamentos"),
+            F.lit(0)
+        ).alias("qtd_pagamentos"),
+
+        F.coalesce(
+            F.col("p.maior_numero_parcelas"),
+            F.lit(0)
+        ).alias("maior_numero_parcelas")
+    )
+
+    .withColumn(
+        "valor_total",
+        F.col("valor_produtos") +
+        F.col("valor_frete")
+    )
+
+    .withColumn(
+        "pagamento_divergente",
+        F.abs(
+            F.col("valor_pago") -
+            F.col("valor_total")
+        ) > F.lit(0.01)
+    )
+)
+
+(
+    df_fPedidos.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/fPedidos")
+)
+
+print(f"✅ fPedidos: {df_fPedidos.count():,}")
+
+# ============================================================
+# fVENDAS
+# GRÃO: 1 LINHA = 1 ITEM DE PEDIDO
+# ============================================================
+
+df_fVendas = (
+    df_items.alias("i")
+
+    .join(
+        df_orders.alias("o"),
+        F.col("i.order_id") ==
+        F.col("o.order_id"),
+        "inner"
+    )
+
+    .join(
+        df_customers.alias("c"),
+        F.col("o.customer_id") ==
+        F.col("c.customer_id"),
+        "inner"
+    )
+
+    .select(
+        F.col("i.order_id")
+            .alias("id_pedido"),
+
+        F.col("i.order_item_id")
+            .alias("id_item_pedido"),
+
+        F.col("c.customer_unique_id")
+            .alias("sk_cliente"),
+
+        F.col("i.product_id")
+            .alias("sk_produto"),
+
+        F.col("i.seller_id")
+            .alias("sk_vendedor"),
+
+        F.col("c.customer_zip_code_prefix")
+            .alias("sk_cep_cliente"),
+
+        F.col("o.order_status")
+            .alias("status_pedido"),
+
+        F.to_date(
+            "o.order_purchase_timestamp"
+        ).alias("data_compra"),
+
+        F.to_date(
+            "o.order_approved_at"
+        ).alias("data_aprovacao"),
+
+        F.to_date(
+            "o.order_delivered_customer_date"
+        ).alias("data_entrega"),
+
+        F.to_date(
+            "o.order_estimated_delivery_date"
+        ).alias("data_entrega_estimada"),
+
+        F.col("i.shipping_limit_date")
+            .alias("data_limite_envio"),
+
+        F.col("i.price")
+            .alias("valor_produto"),
+
+        F.col("i.freight_value")
+            .alias("valor_frete")
+    )
+
+    .withColumn(
+        "valor_total_item",
+        F.col("valor_produto") +
+        F.col("valor_frete")
+    )
+)
+
+(
+    df_fVendas.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/fVendas")
+)
+
+print(f"✅ fVendas: {df_fVendas.count():,}")
+
+# ============================================================
+# fPAGAMENTOS
+# GRÃO: 1 LINHA = 1 REGISTRO DE PAGAMENTO
+# ============================================================
+
+df_fPagamentos = (
+    df_payments.alias("p")
+
+    .join(
+        df_orders.alias("o"),
+        F.col("p.order_id") ==
+        F.col("o.order_id"),
+        "left"
+    )
+
+    .join(
+        df_customers.alias("c"),
+        F.col("o.customer_id") ==
+        F.col("c.customer_id"),
+        "left"
+    )
+
+    .select(
+        F.col("p.order_id")
+            .alias("id_pedido"),
+
+        F.col("p.payment_sequential")
+            .alias("sequencia_pagamento"),
+
+        F.col("c.customer_unique_id")
+            .alias("sk_cliente"),
+
+        F.col("p.payment_type")
+            .alias("tipo_pagamento"),
+
+        F.col("p.payment_installments")
+            .alias("qtd_parcelas"),
+
+        F.col("p.payment_installments_valido")
+            .alias("parcelamento_valido"),
+
+        F.col("p.payment_value")
+            .alias("valor_pagamento"),
+
+        F.to_date(
+            "o.order_purchase_timestamp"
+        ).alias("data_compra")
+    )
+)
+
+(
+    df_fPagamentos.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/fPagamentos")
+)
+
+print(f"✅ fPagamentos: {df_fPagamentos.count():,}")
+
+# ============================================================
+# fAVALIACOES
+# GRÃO: 1 LINHA = 1 AVALIAÇÃO
+# ============================================================
+
+df_fAvaliacoes = (
+    df_reviews.alias("r")
+
+    .join(
+        df_orders.alias("o"),
+        F.col("r.order_id") ==
+        F.col("o.order_id"),
+        "left"
+    )
+
+    .join(
+        df_customers.alias("c"),
+        F.col("o.customer_id") ==
+        F.col("c.customer_id"),
+        "left"
+    )
+
+    .select(
+        F.col("r.review_id")
+            .alias("id_avaliacao"),
+
+        F.col("r.order_id")
+            .alias("id_pedido"),
+
+        F.col("c.customer_unique_id")
+            .alias("sk_cliente"),
+
+        F.col("o.order_status")
+            .alias("status_pedido"),
+
+        F.col("r.review_score")
+            .alias("nota_avaliacao"),
+
+        F.col("r.review_comment_title")
+            .alias("titulo_avaliacao"),
+
+        F.col("r.review_comment_message")
+            .alias("comentario_avaliacao"),
+
+        F.to_date(
+            "r.review_creation_date"
+        ).alias("data_avaliacao"),
+
+        F.col("r.review_creation_date")
+            .alias("timestamp_avaliacao"),
+
+        F.col("r.review_answer_timestamp")
+            .alias("timestamp_resposta")
+    )
+
+    .withColumn(
+        "possui_comentario",
+        F.when(
+            F.col("comentario_avaliacao").isNull() |
+            (F.trim(F.col("comentario_avaliacao")) == ""),
+            False
+        ).otherwise(True)
+    )
+
+    .withColumn(
+        "possui_resposta",
+        F.when(
+            F.col("timestamp_resposta").isNotNull(),
+            True
+        ).otherwise(False)
+    )
+
+    .withColumn(
+        "tempo_resposta_horas",
+        F.when(
+            F.col("timestamp_resposta").isNotNull(),
+            (
+                F.unix_timestamp(
+                    "timestamp_resposta"
+                )
+                -
+                F.unix_timestamp(
+                    "timestamp_avaliacao"
+                )
+            ) / 3600
+        )
+    )
+
+    .dropDuplicates(["id_avaliacao"])
+)
+
+(
+    df_fAvaliacoes.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/fAvaliacoes")
+)
+
+print(f"✅ fAvaliacoes: {df_fAvaliacoes.count():,}")
+
+# ============================================================
+# fENTREGAS
+# GRÃO: 1 LINHA = 1 PEDIDO
+# ============================================================
+
+df_fEntregas = (
+    df_orders.alias("o")
+
+    .join(
+        df_customers.alias("c"),
+        F.col("o.customer_id") ==
+        F.col("c.customer_id"),
+        "left"
+    )
+
+    .select(
+        F.col("o.order_id")
+            .alias("id_pedido"),
+
+        F.col("c.customer_unique_id")
+            .alias("sk_cliente"),
+
+        F.col("c.customer_zip_code_prefix")
+            .alias("sk_cep_cliente"),
+
+        F.col("o.order_status")
+            .alias("status_pedido"),
+
+        F.to_date(
+            "o.order_purchase_timestamp"
+        ).alias("data_compra"),
+
+        F.to_date(
+            "o.order_approved_at"
+        ).alias("data_aprovacao"),
+
+        F.to_date(
+            "o.order_delivered_carrier_date"
+        ).alias("data_envio"),
+
+        F.to_date(
+            "o.order_delivered_customer_date"
+        ).alias("data_entrega"),
+
+        F.to_date(
+            "o.order_estimated_delivery_date"
+        ).alias("data_entrega_estimada")
+    )
+
+    .withColumn(
+        "dias_compra_aprovacao",
+        F.datediff(
+            "data_aprovacao",
+            "data_compra"
+        )
+    )
+
+    .withColumn(
+        "dias_ate_envio",
+        F.datediff(
+            "data_envio",
+            "data_compra"
+        )
+    )
+
+    .withColumn(
+        "dias_entrega",
+        F.when(
+            F.col("data_entrega").isNotNull(),
+            F.datediff(
+                "data_entrega",
+                "data_compra"
+            )
+        )
+    )
+
+    .withColumn(
+        "dias_atraso_entrega",
+        F.when(
+            F.col("data_entrega").isNotNull(),
+            F.datediff(
+                "data_entrega",
+                "data_entrega_estimada"
+            )
+        )
+    )
+
+    .withColumn(
+        "entrega_atrasada",
+        F.when(
+            F.col("dias_atraso_entrega") > 0,
+            True
+        )
+        .when(
+            F.col("data_entrega").isNotNull(),
+            False
+        )
+    )
+)
+
+(
+    df_fEntregas.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(f"{gold_path}/fEntregas")
+)
+
+print(f"✅ fEntregas: {df_fEntregas.count():,}")
+
+# ============================================================
+# VALIDAÇÃO FINAL DA GOLD
+# ============================================================
+
+print("====================================================")
+print("VALIDAÇÃO FINAL DA GOLD")
+print("====================================================")
+
+# -------------------------------
+# DIMENSÕES
+# -------------------------------
+
+print(
+    "dCliente duplicados:",
+    df_dCliente
+        .groupBy("sk_cliente")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "dProduto duplicados:",
+    df_dProduto
+        .groupBy("sk_produto")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "dVendedor duplicados:",
+    df_dVendedor
+        .groupBy("sk_vendedor")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "dLocalidade duplicados:",
+    df_dLocalidade
+        .groupBy("sk_cep")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+# -------------------------------
+# FATOS
+# -------------------------------
+
+print(
+    "fPedidos duplicados:",
+    df_fPedidos
+        .groupBy("id_pedido")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "fVendas duplicados:",
+    df_fVendas
+        .groupBy(
+            "id_pedido",
+            "id_item_pedido"
+        )
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "fPagamentos duplicados:",
+    df_fPagamentos
+        .groupBy(
+            "id_pedido",
+            "sequencia_pagamento"
+        )
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "fAvaliacoes duplicados:",
+    df_fAvaliacoes
+        .groupBy("id_avaliacao")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print(
+    "fEntregas duplicados:",
+    df_fEntregas
+        .groupBy("id_pedido")
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+)
+
+print("====================================================")
+print("✅ GOLD VALIDADA")
+print("====================================================")
+
